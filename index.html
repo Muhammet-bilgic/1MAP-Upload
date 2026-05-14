@@ -530,31 +530,26 @@
   // ============================================================
   const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwLq5zI3o68xOzQhRJh6R9cqiKMbzubRi83WBCnmr3OVFT3D4mloVXX2mNJQyqWNUpq/exec';
 
-  // Per-file size limit. A single Apps Script request is capped at ~50MB
-  // by Google, and base64 encoding adds ~33% overhead. No single image
-  // may exceed this on its own.
+  // Per-file size limit. Each image is sent in its own small request,
+  // so this only needs to be a sane sanity cap, not a tight constraint.
   const MAX_FILE_SIZE_MB = 25;
 
   // Generous overall cap on how many images one submission may contain.
-  const MAX_FILES = 200;
+  const MAX_FILES = 300;
 
-  // ----- Automatic batching -----
-  // Large submissions are split into several requests behind the scenes,
-  // all targeting the SAME Drive folder. The user still submits once and
-  // sees nothing different.
-  //
-  // This is the max RAW bytes per batch BEFORE base64 encoding. Base64
-  // inflates data by ~33%, and Google rejects any single Apps Script
-  // request over ~50MB. We deliberately keep this conservative so that
-  // even a batch full of larger-than-average images stays well under the
-  // ceiling: 18MB raw -> ~24MB encoded + JSON overhead. More batches, but
-  // every batch is safe. Do NOT raise this without understanding the math.
-  const MAX_BATCH_BYTES = 18 * 1024 * 1024;
-
-  // If a batch request fails (size limit, dropped connection, timeout),
-  // retry it this many extra times before giving up. Re-sending is safe:
-  // a failed batch never reaches the folder, so no duplicates are created.
-  const BATCH_RETRIES = 2;
+  // ----- Per-file upload -----
+  // Images are uploaded ONE AT A TIME, each in its own request. This is
+  // deliberately different from sending big multi-file batches:
+  //   • every request is small and fast, so "request too large" can't happen
+  //   • each file is confirmed saved before the next one starts
+  //   • a file that fails is retried on its own, and if it still fails it
+  //     is simply listed at the end — the others are unaffected
+  //   • the server dedups by file content hash, so a retry of a file that
+  //     actually succeeded (but whose response was lost) is recognised and
+  //     NOT saved twice
+  // The volunteer still just fills the form once and taps send once.
+  const FILE_RETRIES = 3;          // extra attempts per file before giving up
+  const RETRY_BACKOFF_MS = 1000;   // base backoff; grows with each attempt
 
   // ============================================================
   // Country list (ISO short list — extend as needed)
@@ -587,6 +582,15 @@
   const dropzone  = document.getElementById('dropzone');
   const fileHelper = document.getElementById('fileHelper');
   let selectedFiles = [];
+
+  // When an upload partially succeeds, we keep the failed files selected
+  // AND remember the folder they were going into. The next tap of "Send"
+  // then reuses that same folder instead of creating a new one, so the
+  // retried files land alongside the ones that already succeeded. The
+  // server's content-hash dedup means even an accidental re-send of an
+  // already-uploaded file is harmless. Reset whenever the file selection
+  // changes, since that's a different upload.
+  let resumeFolderId = null;
 
   function humanSize(bytes) {
     if (bytes < 1024) return bytes + ' B';
@@ -634,7 +638,11 @@
       rm.className = 'file-remove';
       rm.innerHTML = '×';
       rm.setAttribute('aria-label', 'Remove file');
-      rm.onclick = () => { selectedFiles.splice(idx, 1); renderFileList(); };
+      rm.onclick = () => {
+        selectedFiles.splice(idx, 1);
+        resumeFolderId = null; // selection changed → not the same upload
+        renderFileList();
+      };
 
       item.append(thumb, name, size, rm);
       fileList.appendChild(item);
@@ -657,6 +665,7 @@
         selectedFiles.push(f);
       }
     }
+    resumeFolderId = null; // selection changed → start a fresh upload
     renderFileList();
     if (rejected.length) {
       showError('Some files were skipped:\n• ' + rejected.join('\n• '));
@@ -711,28 +720,60 @@
   }
   function hideProgress() { progressWrap.classList.remove('visible'); }
 
-  // Convert File -> base64 string (without data URL prefix)
-  function fileToBase64(file) {
+  // Read a File and return both its base64 string and an MD5-style
+  // content hash. The hash lets the server recognise a file it has
+  // already saved, so a retry of an already-successful upload is never
+  // saved twice. We use SHA-256 via the Web Crypto API (widely supported
+  // on mobile); the server treats the hash purely as an opaque key.
+  function readFileForUpload(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onload = () => {
-        const s = reader.result;
-        const i = s.indexOf(',');
-        resolve(s.substring(i + 1));
+      reader.onload = async () => {
+        try {
+          const buffer = reader.result;                  // ArrayBuffer
+          const b64 = arrayBufferToBase64(buffer);
+          let hash;
+          if (window.crypto && crypto.subtle) {
+            const digest = await crypto.subtle.digest('SHA-256', buffer);
+            hash = bufferToHex(digest);
+          } else {
+            // Fallback: a cheap content-derived key (not cryptographic,
+            // but stable for the same file, which is all we need).
+            hash = 'f-' + file.name + '-' + file.size + '-' + file.lastModified;
+          }
+          resolve({ b64: b64, hash: hash });
+        } catch (err) {
+          reject(err);
+        }
       };
       reader.onerror = reject;
-      reader.readAsDataURL(file);
+      reader.readAsArrayBuffer(file);
     });
   }
 
-  // Generate a unique-enough ID for one batch. Used so the server can
-  // detect and ignore a batch it has already saved (prevents duplicates
-  // if a retry happens after the server already committed the files).
-  function makeBatchId() {
-    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
-    // Fallback for older browsers
-    return 'b-' + Date.now().toString(36) + '-' +
-           Math.random().toString(36).slice(2, 10);
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunk = 0x8000; // avoid call-stack limits on big files
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  function bufferToHex(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let hex = '';
+    for (let i = 0; i < bytes.length; i++) {
+      const h = bytes[i].toString(16);
+      hex += (h.length === 1 ? '0' : '') + h;
+    }
+    return hex;
+  }
+
+  // Small promise-based delay used for retry backoff.
+  function delay(ms) {
+    return new Promise(r => setTimeout(r, ms));
   }
 
   // ============================================================
@@ -769,176 +810,220 @@
     submitBtn.classList.add('loading');
     submitBtn.disabled = true;
     submitBtn.querySelector('.btn-label').textContent = 'Uploading…';
-    setProgress(2, 'Preparing files…');
+    setProgress(2, 'Preparing…');
+
+    // Helper: POST a JSON payload and parse the JSON reply. Throws on any
+    // network error, non-OK status, unparseable body, or success:false.
+    async function postJson(payloadObj) {
+      const res = await fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payloadObj)
+      });
+      const raw = await res.text();
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (parseErr) {
+        throw new Error('The server did not return a valid response.');
+      }
+      if (!res.ok || !parsed.success) {
+        throw new Error(parsed && parsed.error ? parsed.error : 'Server returned an error.');
+      }
+      return parsed;
+    }
+
+    const totalFiles = selectedFiles.length;
 
     try {
-      // ---- Step 1: split the selected files into batches ----
-      // Each batch stays under MAX_BATCH_BYTES (raw, pre-encoding) so the
-      // encoded request stays safely under Google's ~50MB request limit.
-      // A single file larger than the batch limit still goes in its own
-      // batch (it already passed the per-file size check).
-      const batches = [];
-      let current = [];
-      let currentBytes = 0;
-      for (const f of selectedFiles) {
-        if (current.length > 0 && currentBytes + f.size > MAX_BATCH_BYTES) {
-          batches.push(current);
-          current = [];
-          currentBytes = 0;
-        }
-        current.push(f);
-        currentBytes += f.size;
-      }
-      if (current.length > 0) batches.push(current);
+      // ---- Step 1: get the destination folder on the server ----
+      // If this is a retry of a partially-failed upload, reuse the folder
+      // from last time so the retried files join the ones that already
+      // succeeded. Otherwise create a fresh folder.
+      let startResult = null;
+      let folderId = null;
+      let folderPathFromStart = null;
 
-      const totalFiles = selectedFiles.length;
-      const totalBatches = batches.length;
-      let filesSent = 0;
-      let folderId = null;     // set by the server after batch 1
-      let nextIndex = 1;       // continues file numbering across batches
-      let finalResult = null;
-
-      // ---- Step 2: send each batch sequentially to the same folder ----
-      for (let b = 0; b < totalBatches; b++) {
-        const batchFiles = batches[b];
-        const isFinalBatch = (b === totalBatches - 1);
-
-        // A unique ID for THIS batch, generated once. Every retry of this
-        // batch reuses the same ID, so the server can recognise a batch it
-        // has already saved and refuse to write it twice. This makes a
-        // retry safe even if a previous attempt actually reached the
-        // server but its response was lost on the way back.
-        const batchId = makeBatchId();
-
-        // Encode this batch's files one at a time (keeps phone memory low).
-        const encoded = [];
-        for (let i = 0; i < batchFiles.length; i++) {
-          const f = batchFiles[i];
-          const b64 = await fileToBase64(f);
-          encoded.push({ name: f.name, mimeType: f.type || 'image/jpeg', data: b64 });
-
-          // Encoding accounts for the first ~45% of the progress bar.
-          const doneEncoding = filesSent + i + 1;
-          setProgress(
-            2 + (doneEncoding / totalFiles) * 43,
-            totalBatches > 1
-              ? `Preparing ${doneEncoding} of ${totalFiles}…`
-              : `Preparing ${doneEncoding} of ${totalFiles}…`
-          );
-        }
-
-        // Sending accounts for the remaining ~50%.
-        setProgress(
-          45 + (filesSent / totalFiles) * 50,
-          totalBatches > 1
-            ? `Uploading… part ${b + 1} of ${totalBatches}`
-            : 'Sending to 1MAP archive…'
-        );
-
-        const requestBody = JSON.stringify({
-          meta: meta,
-          files: encoded,
-          batchId: batchId,              // stable across retries — see above
-          targetFolderId: folderId,      // null on batch 1; reused afterwards
-          startIndex: nextIndex,         // keeps postcard-001, -002… continuous
-          isFinalBatch: isFinalBatch,
-          batchNumber: b + 1,
-          totalBatches: totalBatches
-        });
-
-        // ---- Send this batch, with automatic retries ----
-        // A batch can fail from a transient hiccup (dropped connection,
-        // momentary server error). Retrying is safe: the server only
-        // commits files on a fully successful request, so a failed attempt
-        // never leaves a partial batch in the folder.
-        let result = null;
-        let lastErr = null;
-        for (let attempt = 0; attempt <= BATCH_RETRIES; attempt++) {
-          if (attempt > 0) {
-            setProgress(
-              45 + (filesSent / totalFiles) * 50,
-              `Retrying part ${b + 1} of ${totalBatches}… (attempt ${attempt + 1})`
-            );
-            // brief backoff before retrying
-            await new Promise(r => setTimeout(r, 1200 * attempt));
-          }
+      if (resumeFolderId) {
+        setProgress(4, 'Resuming upload…');
+        folderId = resumeFolderId;
+        // folderPath is recovered later from the 'finish' call.
+      } else {
+        setProgress(4, 'Creating upload folder…');
+        let startErr = null;
+        for (let attempt = 0; attempt <= FILE_RETRIES; attempt++) {
+          if (attempt > 0) await delay(RETRY_BACKOFF_MS * attempt);
           try {
-            // Apps Script web apps respond best with text/plain to avoid CORS preflight.
-            const res = await fetch(APPS_SCRIPT_URL, {
-              method: 'POST',
-              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-              body: requestBody
-            });
-
-            // A request that's too large is usually rejected before our
-            // script even runs — the response won't be the JSON we expect.
-            const raw = await res.text();
-            try {
-              result = JSON.parse(raw);
-            } catch (parseErr) {
-              throw new Error(
-                'The server did not return a valid response. This usually means ' +
-                'this part of the upload was too large for Google to accept. ' +
-                'Try selecting fewer or smaller images.'
-              );
-            }
-
-            if (!res.ok || !result.success) {
-              throw new Error(result && result.error ? result.error : 'Server returned an error.');
-            }
-            // Success — stop retrying.
-            lastErr = null;
+            startResult = await postJson({ action: 'start', meta: meta });
+            startErr = null;
             break;
           } catch (err) {
-            lastErr = err;
-            result = null;
-            // loop will retry unless this was the last attempt
+            startErr = err;
+          }
+        }
+        if (!startResult) {
+          throw new Error(
+            'Could not start the upload (' +
+            (startErr ? startErr.message : 'unknown error') +
+            '). Nothing was uploaded — please check your connection and try again.'
+          );
+        }
+        folderId = startResult.folderId;
+        folderPathFromStart = startResult.folderPath;
+      }
+
+      // ---- Step 2: upload images ONE AT A TIME ----
+      // Each file is its own request with its own retries. A file that
+      // ultimately fails is collected into failedFiles and reported at
+      // the end; it does NOT stop the remaining files from uploading.
+      let uploadedCount = 0;
+      let duplicateCount = 0;
+      const failedFiles = [];
+
+      for (let i = 0; i < totalFiles; i++) {
+        const file = selectedFiles[i];
+        const human = i + 1;
+
+        setProgress(
+          5 + (i / totalFiles) * 92,
+          `Uploading ${human} of ${totalFiles}…`
+        );
+
+        // Read + hash the file (with a small retry, in case the read fails).
+        let payload = null;
+        let readErr = null;
+        for (let rAttempt = 0; rAttempt <= 1; rAttempt++) {
+          try {
+            const prepared = await readFileForUpload(file);
+            payload = {
+              action: 'file',
+              folderId: folderId,
+              file: {
+                name: file.name,
+                mimeType: file.type || 'image/jpeg',
+                data: prepared.b64,
+                md5: prepared.hash
+              }
+            };
+            readErr = null;
+            break;
+          } catch (err) {
+            readErr = err;
+          }
+        }
+        if (!payload) {
+          failedFiles.push({ name: file.name, reason: 'could not be read on this device' });
+          continue;
+        }
+
+        // Send this one file, with retries. Because the server dedups by
+        // content hash, re-sending a file that actually succeeded is
+        // harmless — the server just replies "duplicate" and moves on.
+        let fileResult = null;
+        let fileErr = null;
+        for (let attempt = 0; attempt <= FILE_RETRIES; attempt++) {
+          if (attempt > 0) {
+            setProgress(
+              5 + (i / totalFiles) * 92,
+              `Retrying ${human} of ${totalFiles}… (attempt ${attempt + 1})`
+            );
+            await delay(RETRY_BACKOFF_MS * attempt);
+          }
+          try {
+            fileResult = await postJson(payload);
+            fileErr = null;
+            break;
+          } catch (err) {
+            fileErr = err;
+            fileResult = null;
           }
         }
 
-        if (lastErr || !result) {
-          throw new Error(
-            (lastErr ? lastErr.message : 'Upload failed.') +
-            (totalBatches > 1
-              ? ` — failed on part ${b + 1} of ${totalBatches}. ` +
-                `Parts 1–${b} were saved; please re-submit the remaining ${totalFiles - filesSent} image(s).`
-              : '')
-          );
+        if (fileResult) {
+          uploadedCount++;
+          if (fileResult.duplicate) duplicateCount++;
+        } else {
+          failedFiles.push({
+            name: file.name,
+            reason: fileErr ? fileErr.message : 'upload failed'
+          });
         }
+      }
 
-        // Carry the folder + numbering forward to the next batch.
-        folderId   = result.folderId;
-        nextIndex  = result.nextIndex;
-        filesSent += batchFiles.length;
-        finalResult = result;
-
-        setProgress(
-          45 + (filesSent / totalFiles) * 50,
-          totalBatches > 1
-            ? `Uploaded ${filesSent} of ${totalFiles}…`
-            : 'Almost done…'
-        );
+      // ---- Step 3: finalise (write metadata + log row) ----
+      // Only meaningful if at least one file made it. Best-effort: a
+      // failure here doesn't lose any images, it just means the
+      // _metadata.json sidecar wasn't written.
+      let finishResult = null;
+      if (uploadedCount > 0) {
+        setProgress(98, 'Finalising…');
+        for (let attempt = 0; attempt <= FILE_RETRIES; attempt++) {
+          if (attempt > 0) await delay(RETRY_BACKOFF_MS * attempt);
+          try {
+            finishResult = await postJson({ action: 'finish', folderId: folderId, meta: meta });
+            break;
+          } catch (err) {
+            finishResult = null;
+          }
+        }
       }
 
       setProgress(100, 'Complete');
       setTimeout(hideProgress, 800);
 
-      const count = finalResult.totalUploaded;
-      showSuccess(
-        `<strong>Thank you!</strong> ${count} postcard${count === 1 ? '' : 's'} saved to:<br>` +
-        `<span style="font-family:monospace; font-size:12px;">${finalResult.folderPath}</span>`
-      );
+      // ---- Step 4: report the outcome ----
+      // folderPath may come from the 'start' call (fresh upload) or the
+      // 'finish' call (always, when it succeeds). On a resumed upload
+      // where finish failed, fall back to a generic label.
+      const folderPath =
+        (finishResult && finishResult.folderPath) ||
+        folderPathFromStart ||
+        (meta.country + ' / ' + meta.city + '-' + meta.organization + '-' + meta.date);
 
-      // Reset for the next submission
-      selectedFiles = [];
-      renderFileList();
-      document.getElementById('uploadForm').reset();
-      document.getElementById('date').valueAsDate = new Date();
-      countrySelect.value = '';
+      if (failedFiles.length === 0) {
+        // Everything uploaded.
+        resumeFolderId = null; // upload complete — no resume needed
+        showSuccess(
+          `<strong>Thank you!</strong> ${uploadedCount} postcard${uploadedCount === 1 ? '' : 's'} saved to:<br>` +
+          `<span style="font-family:monospace; font-size:12px;">${folderPath}</span>`
+        );
+        // Reset the form for the next submission.
+        selectedFiles = [];
+        renderFileList();
+        document.getElementById('uploadForm').reset();
+        document.getElementById('date').valueAsDate = new Date();
+        countrySelect.value = '';
+      } else if (uploadedCount > 0) {
+        // Partial success. Remember this folder so the next tap of "Send"
+        // resumes into it, and keep the failed files selected. The
+        // server's content-hash dedup means a re-sent file that actually
+        // succeeded last time will simply be skipped, not duplicated.
+        resumeFolderId = folderId;
+        const names = failedFiles.map(f => '• ' + f.name).join('<br>');
+        showError(
+          `${uploadedCount} of ${totalFiles} postcards uploaded to ` +
+          `<span style="font-family:monospace; font-size:12px;">${folderPath}</span>.<br><br>` +
+          `<strong>${failedFiles.length} did not upload:</strong><br>${names}<br><br>` +
+          `These are still selected below — just tap <strong>Send postcards</strong> again to retry ` +
+          `only them. They'll go into the same folder, and already-uploaded postcards won't be duplicated.`
+        );
+        // Trim the selection down to just the failures.
+        const failedNames = failedFiles.map(f => f.name);
+        selectedFiles = selectedFiles.filter(f => failedNames.indexOf(f.name) !== -1);
+        renderFileList();
+      } else {
+        // Nothing uploaded at all. Keep the folder for a clean retry.
+        resumeFolderId = folderId;
+        throw new Error(
+          'None of the postcards could be uploaded this time. ' +
+          'Your images are still selected — please check your connection ' +
+          'and tap Send postcards to try again.'
+        );
+      }
 
     } catch (err) {
       hideProgress();
-      showError('Upload failed: ' + err.message);
+      showError(err.message);
     } finally {
       submitBtn.classList.remove('loading');
       submitBtn.disabled = false;
