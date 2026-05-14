@@ -528,12 +528,23 @@
   // ============================================================
   // CONFIGURATION — replace this URL after deploying Apps Script
   // ============================================================
-  const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwLq5zI3o68xOzQhRJh6R9cqiKMbzubRi83WBCnmr3OVFT3D4mloVXX2mNJQyqWNUpq/exec';
+  const APPS_SCRIPT_URL = 'PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
 
-  // Per-file size limit (Apps Script has ~50MB request limit;
-  // we keep generous headroom by capping each image at 15MB).
-  const MAX_FILE_SIZE_MB = 15;
-  const MAX_FILES = 30;
+  // Per-file size limit. A single Apps Script request is capped at ~50MB
+  // by Google, and base64 encoding adds ~33% overhead. No single image
+  // may exceed this on its own.
+  const MAX_FILE_SIZE_MB = 25;
+
+  // Generous overall cap on how many images one submission may contain.
+  const MAX_FILES = 200;
+
+  // ----- Automatic batching -----
+  // Large submissions are split into several requests behind the scenes,
+  // all targeting the SAME Drive folder. The user still submits once and
+  // sees nothing different. This is the max RAW bytes per batch BEFORE
+  // base64 encoding; encoded payload stays comfortably under the ~50MB
+  // request ceiling (e.g. 30MB raw -> ~40MB encoded + JSON overhead).
+  const MAX_BATCH_BYTES = 30 * 1024 * 1024;
 
   // ============================================================
   // Country list (ISO short list — extend as needed)
@@ -741,45 +752,113 @@
     setProgress(2, 'Preparing files…');
 
     try {
-      // Encode each file (one at a time to keep memory low on phones)
-      const encoded = [];
-      for (let i = 0; i < selectedFiles.length; i++) {
-        const f = selectedFiles[i];
-        const b64 = await fileToBase64(f);
-        encoded.push({ name: f.name, mimeType: f.type || 'image/jpeg', data: b64 });
-        setProgress(2 + ((i + 1) / selectedFiles.length) * 40, `Preparing ${i+1} of ${selectedFiles.length}…`);
+      // ---- Step 1: split the selected files into batches ----
+      // Each batch stays under MAX_BATCH_BYTES (raw, pre-encoding) so the
+      // encoded request stays safely under Google's ~50MB request limit.
+      // A single file larger than the batch limit still goes in its own
+      // batch (it already passed the per-file size check).
+      const batches = [];
+      let current = [];
+      let currentBytes = 0;
+      for (const f of selectedFiles) {
+        if (current.length > 0 && currentBytes + f.size > MAX_BATCH_BYTES) {
+          batches.push(current);
+          current = [];
+          currentBytes = 0;
+        }
+        current.push(f);
+        currentBytes += f.size;
       }
+      if (current.length > 0) batches.push(current);
 
-      setProgress(50, 'Sending to 1MAP archive…');
+      const totalFiles = selectedFiles.length;
+      const totalBatches = batches.length;
+      let filesSent = 0;
+      let folderId = null;     // set by the server after batch 1
+      let nextIndex = 1;       // continues file numbering across batches
+      let finalResult = null;
 
-      // Apps Script web apps respond best with text/plain to avoid CORS preflight
-      const res = await fetch(APPS_SCRIPT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ meta, files: encoded })
-      });
+      // ---- Step 2: send each batch sequentially to the same folder ----
+      for (let b = 0; b < totalBatches; b++) {
+        const batchFiles = batches[b];
+        const isFinalBatch = (b === totalBatches - 1);
 
-      setProgress(90, 'Almost done…');
+        // Encode this batch's files one at a time (keeps phone memory low).
+        const encoded = [];
+        for (let i = 0; i < batchFiles.length; i++) {
+          const f = batchFiles[i];
+          const b64 = await fileToBase64(f);
+          encoded.push({ name: f.name, mimeType: f.type || 'image/jpeg', data: b64 });
 
-      const result = await res.json();
-      if (!res.ok || !result.success) {
-        throw new Error(result.error || 'Server returned an error.');
+          // Encoding accounts for the first ~45% of the progress bar.
+          const doneEncoding = filesSent + i + 1;
+          setProgress(
+            2 + (doneEncoding / totalFiles) * 43,
+            totalBatches > 1
+              ? `Preparing ${doneEncoding} of ${totalFiles}…`
+              : `Preparing ${doneEncoding} of ${totalFiles}…`
+          );
+        }
+
+        // Sending accounts for the remaining ~50%.
+        setProgress(
+          45 + (filesSent / totalFiles) * 50,
+          totalBatches > 1
+            ? `Uploading… part ${b + 1} of ${totalBatches}`
+            : 'Sending to 1MAP archive…'
+        );
+
+        // Apps Script web apps respond best with text/plain to avoid CORS preflight.
+        const res = await fetch(APPS_SCRIPT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            meta: meta,
+            files: encoded,
+            targetFolderId: folderId,      // null on batch 1; reused afterwards
+            startIndex: nextIndex,         // keeps postcard-001, -002… continuous
+            isFinalBatch: isFinalBatch,
+            batchNumber: b + 1,
+            totalBatches: totalBatches
+          })
+        });
+
+        const result = await res.json();
+        if (!res.ok || !result.success) {
+          throw new Error(
+            (result && result.error ? result.error : 'Server returned an error.') +
+            (totalBatches > 1 ? ` (part ${b + 1} of ${totalBatches})` : '')
+          );
+        }
+
+        // Carry the folder + numbering forward to the next batch.
+        folderId   = result.folderId;
+        nextIndex  = result.nextIndex;
+        filesSent += batchFiles.length;
+        finalResult = result;
+
+        setProgress(
+          45 + (filesSent / totalFiles) * 50,
+          totalBatches > 1
+            ? `Uploaded ${filesSent} of ${totalFiles}…`
+            : 'Almost done…'
+        );
       }
 
       setProgress(100, 'Complete');
       setTimeout(hideProgress, 800);
 
+      const count = finalResult.totalUploaded;
       showSuccess(
-        `<strong>Thank you!</strong> ${result.uploaded} postcard${result.uploaded === 1 ? '' : 's'} saved to:<br>` +
-        `<span style="font-family:monospace; font-size:12px;">${result.folderPath}</span>`
+        `<strong>Thank you!</strong> ${count} postcard${count === 1 ? '' : 's'} saved to:<br>` +
+        `<span style="font-family:monospace; font-size:12px;">${finalResult.folderPath}</span>`
       );
 
-      // Reset for the next batch
+      // Reset for the next submission
       selectedFiles = [];
       renderFileList();
       document.getElementById('uploadForm').reset();
       document.getElementById('date').valueAsDate = new Date();
-      // Re-populate country dropdown selection blank
       countrySelect.value = '';
 
     } catch (err) {
