@@ -725,6 +725,16 @@
     });
   }
 
+  // Generate a unique-enough ID for one batch. Used so the server can
+  // detect and ignore a batch it has already saved (prevents duplicates
+  // if a retry happens after the server already committed the files).
+  function makeBatchId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    // Fallback for older browsers
+    return 'b-' + Date.now().toString(36) + '-' +
+           Math.random().toString(36).slice(2, 10);
+  }
+
   // ============================================================
   // Submit
   // ============================================================
@@ -793,6 +803,13 @@
         const batchFiles = batches[b];
         const isFinalBatch = (b === totalBatches - 1);
 
+        // A unique ID for THIS batch, generated once. Every retry of this
+        // batch reuses the same ID, so the server can recognise a batch it
+        // has already saved and refuse to write it twice. This makes a
+        // retry safe even if a previous attempt actually reached the
+        // server but its response was lost on the way back.
+        const batchId = makeBatchId();
+
         // Encode this batch's files one at a time (keeps phone memory low).
         const encoded = [];
         for (let i = 0; i < batchFiles.length; i++) {
@@ -821,6 +838,7 @@
         const requestBody = JSON.stringify({
           meta: meta,
           files: encoded,
+          batchId: batchId,              // stable across retries — see above
           targetFolderId: folderId,      // null on batch 1; reused afterwards
           startIndex: nextIndex,         // keeps postcard-001, -002… continuous
           isFinalBatch: isFinalBatch,
